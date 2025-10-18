@@ -1,0 +1,1396 @@
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, collection, query, where, addDoc, updateDoc, deleteDoc, onSnapshot, serverTimestamp, getDocs, setDoc } from 'firebase/firestore';
+import { Utensils, Users, Lightbulb, X, Trash2, Plus, CornerDownLeft, Swords, Copy, UserPlus, Sparkles, Zap, Shield, Crown, Cake, AlertTriangle, ChevronsDown, Tag } from 'lucide-react';
+
+// --- GLOBAL VARIABLES (Provided by the Canvas Environment) ---
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+// -----------------------------------------------------------
+
+// Gemini API Configuration
+const apiKey = ""; // API Key is provided by the environment
+const GEMINI_MODEL = "gemini-2.5-flash-preview-05-20";
+const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+
+// Global Allergy List
+const ALLERGIES = ['Peanuts', 'Tree Nuts', 'Milk', 'Eggs', 'Wheat/Gluten', 'Soy', 'Fish', 'Shellfish', 'Other'];
+
+// Utility to get a simple display name from the UID
+const getDisplayName = (uid) => uid ? `User-${uid.substring(0, 4)}` : 'You';
+const isKidProfile = (profileId) => profileId !== 'self';
+
+// State Management for UI Messages (Non-firebase alerts)
+const useMessage = () => {
+  const [message, setMessage] = useState(null);
+  const showMessage = useCallback((text, type = 'info', duration = 3000) => {
+    setMessage({ text, type });
+    setTimeout(() => setMessage(null), duration);
+  }, []);
+  return [message, showMessage];
+};
+
+// Main Application Component
+const App = () => {
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [activeTab, setActiveTab] = useState('menu');
+  const [userMenus, setUserMenus] = useState([]);
+  const [familyProfiles, setFamilyProfiles] = useState([]); 
+  const [groups, setGroups] = useState([]);
+  const [message, showMessage] = useMessage();
+  const [currentSuggestion, setCurrentSuggestion] = useState(null);
+  const [userSettings, setUserSettings] = useState({ role: 'Single User' }); // NEW STATE
+  
+  // LLM Feature States
+  const [isLlmLoading, setIsLlmLoading] = useState(false);
+  const [expandedOrder, setExpandedOrder] = useState(null);
+  const [compromiseSuggestion, setCompromiseSuggestion] = useState(null);
+  const [inviteMessage, setInviteMessage] = useState(null); 
+  const [suggestionJustification, setSuggestionJustification] = useState(null);
+  
+  // Memoized path constants
+  const getMenuCollectionPath = useCallback((uid) => `artifacts/${appId}/users/${uid}/user_menus`, []);
+  const getFamilyProfilesCollectionPath = useCallback((uid) => `artifacts/${appId}/users/${uid}/family_profiles`, []);
+  const getGroupCollectionPath = useMemo(() => `artifacts/${appId}/public/data/groups`, []);
+  // NEW PATH
+  const getUserSettingsDocPath = useCallback((uid) => doc(db, `artifacts/${appId}/users/${uid}/user_settings`, 'main_settings'), [db]);
+
+  // 1. Firebase Initialization and Authentication
+  useEffect(() => {
+    if (firebaseConfig) {
+      try {
+        const app = initializeApp(firebaseConfig);
+        const firestoreDb = getFirestore(app);
+        const firebaseAuth = getAuth(app);
+        setDb(firestoreDb);
+        setAuth(firebaseAuth);
+
+        const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+          if (user) {
+            setUserId(user.uid);
+          } else {
+            try {
+              if (initialAuthToken) {
+                const credential = await signInWithCustomToken(firebaseAuth, initialAuthToken);
+                setUserId(credential.user.uid);
+              } else {
+                const credential = await signInAnonymously(firebaseAuth);
+                setUserId(credential.user.uid);
+              }
+            } catch (error) {
+              console.error("Authentication Error:", error);
+              const credential = await signInAnonymously(firebaseAuth);
+              setUserId(credential.user.uid);
+            }
+          }
+          setIsAuthReady(true);
+        });
+        return () => unsubscribe();
+      } catch (e) {
+        console.error("Firebase Initialization Error:", e);
+        showMessage("Failed to initialize app.", "error");
+      }
+    }
+  }, [firebaseConfig, initialAuthToken, showMessage]);
+
+  // 1.5 Fetch User Settings (NEW)
+  useEffect(() => {
+    if (db && userId) {
+        const docRef = doc(db, `artifacts/${appId}/users/${userId}/user_settings`, 'main_settings');
+        const unsubscribe = onSnapshot(docRef, (docSnap) => {
+            if (docSnap.exists()) {
+                setUserSettings(docSnap.data());
+            } else {
+                // Initialize settings if they don't exist
+                const initialSettings = { role: 'Single User' };
+                setUserSettings(initialSettings);
+                // Attempt to create the document (non-blocking)
+                setDoc(docRef, initialSettings).catch(e => console.error("Error initializing user settings:", e));
+            }
+        }, (error) => {
+            console.error("Error fetching user settings:", error);
+        });
+        return () => unsubscribe();
+    }
+  }, [db, userId, showMessage]);
+
+  // Function to update the user's role
+  const updateRole = async (newRole) => {
+      if (!db || !userId) return showMessage("App is not ready.", "error");
+      try {
+          const docRef = doc(db, `artifacts/${appId}/users/${userId}/user_settings`, 'main_settings');
+          await updateDoc(docRef, { role: newRole });
+          showMessage(`Primary role updated to ${newRole}!`, "success");
+      } catch (e) {
+          console.error("Error updating role:", e);
+          showMessage("Could not update role.", "error");
+      }
+  };
+
+
+  // 2. Fetch User's Personal Menus (Private Data) - UNCHANGED
+  useEffect(() => {
+    if (db && userId) {
+      const q = collection(db, getMenuCollectionPath(userId));
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const items = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+        setUserMenus(items);
+      }, (error) => {
+        console.error("Error fetching user menus:", error);
+        showMessage("Failed to load your personal menu.", "error");
+      });
+      return () => unsubscribe();
+    }
+  }, [db, userId, getMenuCollectionPath, showMessage]);
+  
+  // 3. Fetch Family Profiles (UPDATED)
+  useEffect(() => {
+    if (db && userId) {
+      const q = collection(db, getFamilyProfilesCollectionPath(userId));
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const profiles = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+        setFamilyProfiles(profiles); // Use setFamilyProfiles
+      }, (error) => {
+        console.error("Error fetching family profiles:", error);
+      });
+      return () => unsubscribe();
+    }
+  }, [db, userId, getFamilyProfilesCollectionPath]);
+
+
+  // 4. Fetch Groups (Public Data) - UNCHANGED
+  useEffect(() => {
+    if (db && userId && isAuthReady) {
+      const q = query(collection(db, getGroupCollectionPath), where('memberUids', 'array-contains', userId));
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const groupList = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+        setGroups(groupList);
+      }, (error) => {
+        console.error("Error fetching groups:", error);
+        showMessage("Failed to load your groups.", "error");
+      });
+      return () => unsubscribe();
+    }
+  }, [db, userId, isAuthReady, getGroupCollectionPath, showMessage]);
+  
+  // Utility function to get the profile name (self or family member's name)
+  const getProfileName = (profileId) => {
+    if (profileId === 'self') return getDisplayName(userId) || 'You';
+    const profile = familyProfiles.find(p => p.id === profileId);
+    return profile ? profile.name : 'Unknown';
+  };
+  
+  const getProfile = (profileId) => {
+    if (profileId === 'self') return { name: getDisplayName(userId), type: 'Adult', allergies: [], birthday: '' };
+    return familyProfiles.find(p => p.id === profileId);
+  };
+
+  // --- LLM API Call Utility (unchanged) ---
+  const fetchGeminiResponse = async (userQuery, systemPrompt) => {
+    setIsLlmLoading(true);
+    let attempts = 0;
+    const maxAttempts = 3;
+
+    while (attempts < maxAttempts) {
+      try {
+        const payload = {
+          contents: [{ parts: [{ text: userQuery }] }],
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+        };
+
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        const result = await response.json();
+        const text = result.candidates?.[0]?.content?.parts?.[0]?.text || 'Could not generate a response.';
+        setIsLlmLoading(false);
+        return text;
+
+      } catch (error) {
+        attempts++;
+        if (attempts >= maxAttempts) {
+          console.error("Gemini API call failed after multiple retries:", error);
+          setIsLlmLoading(false);
+          showMessage("LLM service is temporarily unavailable.", "error");
+          return 'Error: Failed to get response from AI.';
+        }
+        const delay = Math.pow(2, attempts) * 1000;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+    }
+  };
+
+  const generateOrderDetails = async (restaurant, order) => {
+    setExpandedOrder(null);
+    setActiveTab('menu');
+    const systemPrompt = `You are a highly creative and detailed culinary analyst. Expand the user's simple go-to order (Restaurant: ${restaurant}, Order: ${order}) into a professional, mouth-watering description, including recommended side dishes, suggested drink pairings, and a short (one-line) fun fact or history about the dish or cuisine type. Use bold markdown for key details.`;
+    const userQuery = `Expand this order: ${order} from ${restaurant}`;
+    
+    const details = await fetchGeminiResponse(userQuery, systemPrompt);
+    setExpandedOrder({ restaurant, order, details });
+  };
+  
+  const generateGroupCompromise = async (group) => {
+    setCompromiseSuggestion(null);
+    
+    // Flatten orders for the LLM
+    const uniqueRestaurants = [...new Set(group.restaurantOrders.map(r => r.restaurantName))];
+    const allOrders = group.restaurantOrders.flatMap(r => 
+        r.orders.map(o => `${r.restaurantName} (${getDisplayName(o.userId)}): ${o.order}`)
+    ).join('\n');
+    
+    if (uniqueRestaurants.length < 2) {
+        showMessage("Need at least two different restaurant types to suggest a compromise.", "warning");
+        return;
+    }
+
+    const systemPrompt = `You are a professional diplomatic group mediator and a gourmet food expert. Based on the following diverse list of preferred restaurants/orders from a group, suggest a single, ideal compromise restaurant type or cuisine that incorporates elements from the different tastes. Explain your choice in one short, engaging paragraph and suggest a specific dish everyone should try at the compromise location. Format your output in markdown.`;
+    const userQuery = `Group orders:\n${allOrders}`;
+    
+    const suggestion = await fetchGeminiResponse(userQuery, systemPrompt);
+    setCompromiseSuggestion({ groupName: group.name, suggestion });
+  };
+  
+  const generateGroupInviteMessage = async (group) => {
+    setInviteMessage(null);
+    
+    // Flatten orders for the LLM
+    const uniqueRestaurants = [...new Set(group.restaurantOrders.map(r => r.restaurantName))];
+    const allOrders = group.restaurantOrders.flatMap(r => 
+        r.orders.map(o => `${r.restaurantName} (${getDisplayName(o.userId)}): ${o.order}`)
+    ).join('; ');
+    
+    if (uniqueRestaurants.length === 0) {
+        showMessage("No orders saved in this group yet. Add some first!", "warning");
+        return;
+    }
+
+    const systemPrompt = `You are a fun, casual, and slightly sarcastic friend sending a group chat message to finalize dinner plans based on saved go-to orders. Generate a short, one-paragraph message (under 3 sentences) that confirms the restaurant choices and asks everyone to finalize their order. Include a fun emoji. The style should be suitable for a text message/WhatsApp group.`;
+    const userQuery = `The group has these current saved orders: ${allOrders}. The primary restaurants suggested are: ${uniqueRestaurants.join(', ')}.`;
+    
+    const message = await fetchGeminiResponse(userQuery, systemPrompt);
+    setInviteMessage({ groupName: group.name, message });
+    showMessage("Invite message generated!", "success");
+  };
+
+  const generateSuggestionJustification = async (restaurant, order) => {
+    const systemPrompt = "You are a highly enthusiastic, motivational food guru/decision-maker. Your job is to convince the user why they should eat the suggested meal right now based on current life/mood factors. Generate a catchy title (using a fun emoji) and a short, punchy paragraph (under 3 sentences) justifying the meal based on reasons like 'you deserve a treat,' 'it's fast and easy,' 'perfect for this weather,' or 'a flavor adventure.' Use bold markdown for key details.";
+    const userQuery = `Justify why I should eat: ${order} from ${restaurant}.`;
+    
+    const justification = await fetchGeminiResponse(userQuery, systemPrompt);
+    return justification;
+  };
+
+  // --- Utility Functions (unchanged) ---
+
+  const copyText = (text, successMessage) => {
+    if (!text) return;
+    const el = document.createElement('textarea');
+    el.value = text;
+    document.body.appendChild(el);
+    el.select();
+    try {
+      document.execCommand('copy');
+      showMessage(successMessage, "success");
+    } catch (err) {
+      console.error('Could not copy text: ', err);
+      showMessage("Failed to copy. Please select and copy manually.", "error");
+    }
+    document.body.removeChild(el);
+  };
+  
+  const copyUserId = () => {
+    if (!userId) return;
+    copyText(userId, "User ID copied to clipboard!");
+  };
+
+  // --- CRUD Operations for Family Profiles (UPDATED) ---
+
+  const addFamilyProfile = async ({ name, type, birthday, allergies }) => {
+    if (!db || !userId) return showMessage("App is not ready.", "error");
+    const trimmedName = name.trim();
+    if (!trimmedName) return showMessage("Profile name cannot be empty.", "warning");
+    
+    try {
+      await addDoc(collection(db, getFamilyProfilesCollectionPath(userId)), {
+        name: trimmedName,
+        type: type, // 'Kid' or 'Adult'
+        birthday: birthday, // Month/Day string
+        allergies: allergies, // Array of strings
+        createdAt: serverTimestamp(),
+      });
+      showMessage(`${trimmedName} profile (${type}) added!`, "success");
+    } catch (e) {
+      console.error("Error adding family profile: ", e);
+      showMessage("Could not add profile.", "error");
+    }
+  };
+
+  const deleteFamilyProfile = async (id) => {
+    if (!db || !userId) return showMessage("App is not ready.", "error");
+    try {
+      // Find and delete all menu items belonging to this profile first
+      const q = query(collection(db, getMenuCollectionPath(userId)), where('profileId', '==', id));
+      const snapshot = await getDocs(q); 
+      snapshot.forEach(async (doc) => {
+        await deleteDoc(doc.ref);
+      });
+      
+      // Then delete the profile itself
+      await deleteDoc(doc(db, getFamilyProfilesCollectionPath(userId), id));
+      showMessage("Profile and associated orders removed.", "success");
+    } catch (e) {
+      console.error("Error removing family profile: ", e);
+      showMessage("Could not remove profile.", "error");
+    }
+  };
+
+  // --- CRUD Operations for Personal Menu (UNCHANGED logic, UPDATED usage) ---
+
+  const addMenuItem = async ({ name, order, profileId }) => {
+    if (!db || !userId) return showMessage("App is not ready.", "error");
+    try {
+      await addDoc(collection(db, getMenuCollectionPath(userId)), {
+        name: name.trim(),
+        order: order.trim(),
+        profileId: profileId || 'self', // Default to 'self'
+        createdAt: serverTimestamp(),
+      });
+      showMessage("Order saved!", "success");
+    } catch (e) {
+      console.error("Error adding document: ", e);
+      showMessage("Could not save order.", "error");
+    }
+  };
+
+  const deleteMenuItem = async (id) => {
+    if (!db || !userId) return showMessage("App is not ready.", "error");
+    try {
+      await deleteDoc(doc(db, getMenuCollectionPath(userId), id));
+      showMessage("Order removed.", "success");
+    } catch (e) {
+      console.error("Error removing document: ", e);
+      showMessage("Could not remove order.", "error");
+    }
+  };
+
+  // --- Group Management Functions (UNCHANGED) ---
+
+  const createGroup = async (groupName) => {
+    if (!db || !userId) return showMessage("App is not ready.", "error");
+    const newGroupName = groupName.trim();
+    if (!newGroupName) return showMessage("Group name cannot be empty.", "warning");
+
+    try {
+      await addDoc(collection(db, getGroupCollectionPath), {
+        name: newGroupName,
+        memberUids: [userId],
+        members: [{ uid: userId, name: getDisplayName(userId) }],
+        restaurantOrders: [], 
+        createdAt: serverTimestamp(),
+      });
+      showMessage(`Group "${newGroupName}" created!`, "success");
+    } catch (e) {
+      console.error("Error creating group: ", e);
+      showMessage("Could not create group.", "error");
+    }
+  };
+
+  const addOrderToGroup = async (groupId, restaurantName, orderDescription) => {
+    if (!db || !userId) return showMessage("App is not ready.", "error");
+    const restName = restaurantName.trim();
+    const orderDesc = orderDescription.trim();
+    if (!restName || !orderDesc) return showMessage("Restaurant and order cannot be empty.", "warning");
+
+    try {
+      const groupRef = doc(db, getGroupCollectionPath, groupId);
+      const group = groups.find(g => g.id === groupId);
+
+      if (!group) return showMessage("Group not found.", "error");
+
+      let updatedRestaurantOrders = [...(group.restaurantOrders || [])];
+      const existingRestaurantIndex = updatedRestaurantOrders.findIndex(r => r.restaurantName.toLowerCase() === restName.toLowerCase());
+
+      if (existingRestaurantIndex > -1) {
+        let orders = updatedRestaurantOrders[existingRestaurantIndex].orders || [];
+        const existingOrderIndex = orders.findIndex(o => o.userId === userId);
+
+        if (existingOrderIndex > -1) {
+          orders[existingOrderIndex] = { userId, order: orderDesc };
+        } else {
+          orders.push({ userId, order: orderDesc });
+        }
+        updatedRestaurantOrders[existingRestaurantIndex].orders = orders;
+      } else {
+        updatedRestaurantOrders.push({
+          restaurantName: restName,
+          orders: [{ userId, order: orderDesc }],
+          votes: [],
+        });
+      }
+
+      await updateDoc(groupRef, { restaurantOrders: updatedRestaurantOrders });
+      showMessage(`Your order for ${restName} saved in the group!`, "success");
+    } catch (e) {
+      console.error("Error adding order to group: ", e);
+      showMessage("Could not save group order.", "error");
+    }
+  };
+
+  const inviteUserToGroup = async (groupId, targetUserId) => {
+    if (!db || !userId) return showMessage("App is not ready.", "error");
+    const idToInvite = targetUserId.trim();
+
+    if (!idToInvite) return showMessage("Please enter a User ID.", "warning");
+    if (idToInvite === userId) return showMessage("That's your ID!", "warning");
+    
+    try {
+        const groupRef = doc(db, getGroupCollectionPath, groupId);
+        const group = groups.find(g => g.id === groupId);
+
+        if (!group) return showMessage("Group not found.", "error");
+        if (group.memberUids.includes(idToInvite)) return showMessage("User is already a member.", "warning");
+        
+        const newMember = { uid: idToInvite, name: getDisplayName(idToInvite) };
+
+        await updateDoc(groupRef, {
+            memberUids: [...group.memberUids, idToInvite],
+            members: [...(group.members || []), newMember]
+        });
+        showMessage(`User ${getDisplayName(idToInvite)} invited successfully!`, "success");
+    } catch (e) {
+        console.error("Error inviting user:", e);
+        showMessage("Could not invite user.", "error");
+    }
+  };
+
+  const handleVote = async (groupId, restaurantName) => {
+    if (!db || !userId) return showMessage("App is not ready.", "error");
+    
+    try {
+      const groupRef = doc(db, getGroupCollectionPath, groupId);
+      const group = groups.find(g => g.id === groupId);
+      if (!group) return showMessage("Group not found.", "error");
+
+      let updatedRestaurantOrders = [...(group.restaurantOrders || [])];
+      const restIndex = updatedRestaurantOrders.findIndex(r => r.restaurantName === restaurantName);
+
+      if (restIndex > -1) {
+        let votes = updatedRestaurantOrders[restIndex].votes || [];
+        const userHasVoted = votes.includes(userId);
+
+        if (userHasVoted) {
+          updatedRestaurantOrders[restIndex].votes = votes.filter(uid => uid !== userId);
+          showMessage(`Unvoted for ${restaurantName}.`, "info");
+        } else {
+          updatedRestaurantOrders.forEach((r, index) => {
+            if (index !== restIndex) {
+              r.votes = (r.votes || []).filter(uid => uid !== userId);
+            }
+          });
+          updatedRestaurantOrders[restIndex].votes = [...votes, userId];
+          showMessage(`Voted for ${restaurantName}!`, "success");
+        }
+
+        await updateDoc(groupRef, { restaurantOrders: updatedRestaurantOrders });
+
+      } else {
+        showMessage("Restaurant not found for voting.", "error");
+      }
+    } catch (e) {
+      console.error("Error handling vote: ", e);
+      showMessage("Could not process vote.", "error");
+    }
+  };
+
+  const suggestDinner = async () => {
+    if (userMenus.length === 0) {
+      setCurrentSuggestion({ restaurant: 'No Saved Menus', order: 'Add some favorite orders first!' });
+      setSuggestionJustification(null);
+      return;
+    }
+    
+    setSuggestionJustification(null); 
+    setCurrentSuggestion(null);
+    setIsLlmLoading(true);
+
+    await new Promise(resolve => setTimeout(resolve, 800)); 
+    
+    // Filter to only include 'self' profile for suggestions
+    const selfMenus = userMenus.filter(m => m.profileId === 'self');
+
+    if (selfMenus.length === 0) {
+      setIsLlmLoading(false);
+      setCurrentSuggestion({ restaurant: 'No *Your* Menus', order: 'Add some go-to orders for yourself!' });
+      return;
+    }
+    
+    const randomIndex = Math.floor(Math.random() * selfMenus.length);
+    const suggestion = selfMenus[randomIndex];
+
+    setCurrentSuggestion({
+      restaurant: suggestion.name,
+      order: suggestion.order,
+      isNew: true
+    });
+    
+    const justification = await generateSuggestionJustification(suggestion.name, suggestion.order);
+    
+    setSuggestionJustification(justification);
+    setIsLlmLoading(false);
+    showMessage("The Master Menu has spoken!", "info");
+    setActiveTab('suggest');
+  };
+
+  // --- Sub-Components ---
+  // ... (LoadingState, MessageBar, LlmLoader are visually unchanged but included)
+
+  const LoadingState = ({ message = "Connecting to the culinary database..." }) => (
+    <div className="flex flex-col items-center justify-center p-8 text-center text-gray-500">
+      <Utensils className="w-10 h-10 mb-4 animate-spin text-cyan-400" />
+      <p className="font-semibold text-lg">{message}</p>
+      <p className="text-sm">User ID: {userId ? userId : 'N/A'}</p>
+    </div>
+  );
+
+  const MessageBar = () => {
+    if (!message) return null;
+    const baseClasses = "fixed top-4 left-1/2 -translate-x-1/2 p-3 text-sm font-medium rounded-lg shadow-xl z-50 transition-all duration-300";
+    const colorClasses = {
+      // UPDATED: Orange -> Cyan/Blue for accents
+      info: "bg-cyan-600 text-white", 
+      success: "bg-emerald-500 text-white",
+      error: "bg-red-500 text-white",
+      warning: "bg-amber-500 text-white",
+    }[message.type] || "bg-gray-700 text-white";
+
+    return (
+      <div className={`${baseClasses} ${colorClasses}`}>
+        {message.text}
+      </div>
+    );
+  };
+
+  const LlmLoader = () => (
+    // UPDATED: Yellow -> Blue for LLM/Info
+    <div className="flex items-center justify-center p-4 bg-blue-50 rounded-xl border border-blue-400 shadow-md">
+      <Zap className="w-5 h-5 mr-3 text-blue-700 animate-pulse" />
+      <p className="text-sm font-semibold text-blue-800">Gemini is deciding for you...</p> {/* FIX: Removed duplicate className */}
+    </div>
+  );
+  
+  // Component: Role Selector
+  const RoleSelector = () => {
+    const roles = [
+        { key: 'Single User', label: 'Single User (Personal Menu)' },
+        { key: 'Group Manager', label: 'Group Manager (Roommates/Friends)' },
+        { key: 'Family Manager & Caregiver', label: 'Family Manager & Caregiver (Profiles/Allergies)' },
+    ];
+
+    const currentRole = userSettings.role || 'Single User';
+
+    return (
+        <div className="p-5 bg-gray-100 rounded-2xl shadow-inner border border-gray-300">
+            <h4 className="text-lg font-bold text-gray-800 mb-3 flex items-center border-b pb-2">
+                <Tag className="w-5 h-5 mr-2 text-cyan-600" /> Primary Role Selector
+            </h4>
+            <p className='text-sm text-gray-600 mb-3'>
+                Choose the role that best defines how you use the app. This updates the main header title.
+            </p>
+            <select
+                value={currentRole}
+                onChange={(e) => updateRole(e.target.value)}
+                className="w-full p-3 border border-gray-300 rounded-xl focus:ring-cyan-500 shadow-sm bg-white font-medium text-lg text-cyan-700"
+            >
+                {roles.map(role => (
+                    <option key={role.key} value={role.key}>
+                        {role.label}
+                    </option>
+                ))}
+            </select>
+        </div>
+    );
+  };
+
+  // --- Family Manager Component (NEW/UPDATED) ---
+
+  const AllergySummary = () => {
+    const allAllergies = familyProfiles.flatMap(p => p.allergies || []);
+    const uniqueAllergies = [...new Set(allAllergies)];
+    
+    if (uniqueAllergies.length === 0) {
+      return (
+        // UPDATED: Stone -> Gray
+        <div className="p-4 text-center bg-gray-100 rounded-xl text-gray-600 border border-gray-200">
+          <p className="font-medium">No family allergies recorded.</p>
+        </div>
+      );
+    }
+
+    return (
+      <div className="p-5 bg-red-100 rounded-xl shadow-lg border-2 border-red-400">
+        <h4 className="text-lg font-bold text-red-700 mb-3 flex items-center">
+          <AlertTriangle className="w-5 h-5 mr-2 fill-red-400 text-red-700" /> Critical Allergy Summary (Caregiver Tool)
+        </h4>
+        <div className="flex flex-wrap gap-2">
+          {uniqueAllergies.map(allergy => (
+            <span key={allergy} className="px-3 py-1 bg-red-500 text-white text-sm font-semibold rounded-full shadow-md">
+              {allergy}
+            </span>
+          ))}
+        </div>
+        <p className="text-xs text-red-600 mt-3 italic">Always check ingredients before ordering.</p>
+      </div>
+    );
+  };
+
+  const AddFamilyProfileForm = () => {
+    const [name, setName] = useState('');
+    const [type, setType] = useState('Kid');
+    const [birthday, setBirthday] = useState('');
+    const [selectedAllergies, setSelectedAllergies] = useState([]);
+    const [isFormOpen, setIsFormOpen] = useState(false);
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      addFamilyProfile({ name, type, birthday, allergies: selectedAllergies });
+      setName('');
+      setType('Kid');
+      setBirthday('');
+      setSelectedAllergies([]);
+      setIsFormOpen(false);
+    };
+
+    const handleAllergyToggle = (allergy) => {
+        setSelectedAllergies(prev => 
+            prev.includes(allergy) 
+                ? prev.filter(a => a !== allergy) 
+                : [...prev, allergy]
+        );
+    };
+    
+    const profileIcon = type === 'Kid' ? <Shield className="w-4 h-4 mr-2 text-emerald-500" /> : <UserPlus className="w-4 h-4 mr-2 text-blue-500" />;
+
+    return (
+      // UPDATED: Stone -> Gray
+      <div className="p-5 bg-gray-100 rounded-xl shadow-inner border border-gray-200">
+        <button 
+            onClick={() => setIsFormOpen(!isFormOpen)}
+            className="w-full flex justify-between items-center text-lg font-semibold text-gray-800 p-2 bg-gray-200 hover:bg-gray-300 rounded-lg transition duration-150"
+        >
+            Family Manager & Caregiver Tool
+            {isFormOpen ? <ChevronsDown className="w-5 h-5 transform rotate-180" /> : <ChevronsDown className="w-5 h-5" />}
+        </button>
+        
+        {isFormOpen && (
+            <div className='mt-4'>
+            <h4 className="text-md font-semibold text-gray-700 mb-3 border-b pb-2 flex items-center">
+                {profileIcon} Add New Profile
+            </h4>
+            <form onSubmit={handleSubmit} className="space-y-4">
+                <div className="flex space-x-2">
+                    <select 
+                        value={type}
+                        onChange={(e) => setType(e.target.value)}
+                        className="w-1/3 p-3 border border-gray-300 rounded-xl focus:ring-cyan-500 shadow-sm bg-white font-medium"
+                    >
+                        <option value="Kid">Kid</option>
+                        <option value="Adult">Adult</option>
+                    </select>
+                    <input
+                        type="text"
+                        placeholder="Name (e.g., 'Lily', 'Grandma')"
+                        value={name}
+                        onChange={(e) => setName(e.target.value)}
+                        required
+                        className="flex-1 p-3 border border-gray-300 rounded-xl focus:ring-cyan-500 shadow-sm"
+                    />
+                </div>
+                
+                <div className="flex space-x-2">
+                    <label className="w-1/3 p-3 border border-gray-300 rounded-xl bg-gray-50 text-gray-600 shadow-sm flex items-center">Birthday</label>
+                    <input
+                        type="text"
+                        placeholder="Month/Day (e.g., Dec 25)"
+                        value={birthday}
+                        onChange={(e) => setBirthday(e.target.value)}
+                        className="flex-1 p-3 border border-gray-300 rounded-xl focus:ring-cyan-500 shadow-sm"
+                    />
+                </div>
+
+                {/* Allergy Selection */}
+                <h5 className="text-sm font-semibold text-gray-700 pt-2">Food Allergies (select all that apply):</h5>
+                <div className="flex flex-wrap gap-2 p-3 bg-white rounded-xl border border-gray-300">
+                    {ALLERGIES.map(allergy => (
+                        <button
+                            key={allergy}
+                            type="button"
+                            onClick={() => handleAllergyToggle(allergy)}
+                            className={`px-3 py-1 text-sm rounded-full transition duration-150 ${
+                                selectedAllergies.includes(allergy)
+                                    ? 'bg-red-500 text-white shadow-md'
+                                    : 'bg-gray-200 text-gray-700 hover:bg-gray-300' // UPDATED: Stone -> Gray
+                            }`}
+                        >
+                            {allergy} {selectedAllergies.includes(allergy) ? '✓' : ''}
+                        </button>
+                    ))}
+                </div>
+
+                <button
+                    type="submit"
+                    // UPDATED: Orange -> Cyan
+                    className="w-full bg-cyan-700 text-white p-3 rounded-xl font-semibold hover:bg-cyan-800 transition shadow-lg flex items-center justify-center"
+                >
+                    <UserPlus className="w-5 h-5 mr-2" /> Create Profile
+                </button>
+            </form>
+            </div>
+        )}
+
+        {/* Existing Profiles List */}
+        {familyProfiles.length > 0 && (
+          <div className="space-y-2 mt-4 pt-3 border-t border-gray-300">
+            <p className='text-md font-semibold text-gray-800'>Existing Profiles:</p>
+            {familyProfiles.map(profile => (
+              // UPDATED: Stone -> Gray
+              <div key={profile.id} className="flex justify-between items-center p-3 bg-white rounded-lg border border-gray-300 shadow-sm">
+                <div className="flex items-center space-x-2">
+                    <span className={`px-2 py-1 text-xs font-bold rounded-full ${profile.type === 'Kid' ? 'bg-emerald-500 text-white' : 'bg-blue-500 text-white'}`}>
+                        {profile.type}
+                    </span>
+                    <span className="font-medium text-gray-700">{profile.name}</span>
+                    {profile.birthday && <Cake className='w-4 h-4 text-pink-500' title={`Birthday: ${profile.birthday}`} />}
+                    {(profile.allergies && profile.allergies.length > 0) && <AlertTriangle className='w-4 h-4 text-red-500' title={`Allergies: ${profile.allergies.join(', ')}`} />}
+                </div>
+                <button
+                  onClick={() => deleteFamilyProfile(profile.id)}
+                  className="p-1 text-red-500 hover:text-red-700 rounded-full transition bg-red-50 hover:bg-red-100"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+  
+  // --- MISSING COMPONENT RECONSTRUCTED AND INSERTED HERE ---
+  const AddMenuItemForm = () => {
+    // useState is safe here because this component is defined within App's closure scope
+    const [name, setName] = useState('');
+    const [order, setOrder] = useState('');
+    const [profileId, setProfileId] = useState('self'); // Default to 'self'
+
+    const handleSubmit = (e) => {
+      e.preventDefault();
+      addMenuItem({ name, order, profileId }); // addMenuItem is accessible via closure
+      setName('');
+      setOrder('');
+    };
+
+    const profileOptions = [
+      { id: 'self', name: `${getDisplayName(userId)} (You)` },
+      ...familyProfiles // familyProfiles is accessible via closure
+    ];
+
+    return (
+      <form onSubmit={handleSubmit} className="p-6 bg-white rounded-2xl shadow-xl mb-6 border border-gray-100">
+        <h3 className="text-xl font-bold text-gray-800 mb-4 flex items-center">
+          <Plus className="w-5 h-5 mr-2 text-cyan-600" /> {/* UPDATED: Orange -> Cyan */}
+          Add A Go-To Order
+        </h3>
+        <div className="space-y-4">
+          
+          <select 
+            value={profileId}
+            onChange={(e) => setProfileId(e.target.value)}
+            // UPDATED: Orange -> Cyan
+            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-cyan-500 focus:border-cyan-500 transition duration-150 shadow-sm bg-white"
+          >
+            {profileOptions.map(p => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+
+          <input
+            type="text"
+            placeholder="Restaurant Name (e.g., 'Taco Palace')"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+            // UPDATED: Orange -> Cyan
+            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-cyan-500 focus:border-cyan-500 transition duration-150 shadow-sm"
+          />
+          <input
+            type="text"
+            placeholder="Go-To Order (e.g., 'The Triple Deluxe Burrito')"
+            value={order}
+            onChange={(e) => setOrder(e.target.value)}
+            required
+            // UPDATED: Orange -> Cyan
+            className="w-full p-3 border border-gray-300 rounded-xl focus:ring-cyan-500 focus:border-cyan-500 transition duration-150 shadow-sm"
+          />
+          <button
+            type="submit"
+            // UPDATED: Orange -> Cyan
+            className="w-full bg-cyan-700 text-white p-3 rounded-xl font-semibold hover:bg-cyan-800 transition duration-200 shadow-lg transform hover:scale-[1.01] flex items-center justify-center"
+          >
+            <CornerDownLeft className="w-5 h-5 mr-2" /> Save Order
+          </button>
+        </div>
+      </form>
+    );
+  };
+  // -------------------------------------------------------------------
+
+
+  const MenuList = () => (
+    <div className="space-y-4">
+      {isLlmLoading && <LlmLoader />}
+
+      {expandedOrder && (
+        <div className="p-6 bg-blue-50 rounded-2xl shadow-xl border-l-4 border-blue-500 space-y-3"> {/* UPDATED: Yellow -> Blue */}
+            <div className="flex justify-between items-center">
+                <h4 className="text-xl font-bold text-blue-800 flex items-center"> {/* UPDATED: Yellow -> Blue */}
+                    <Sparkles className="w-5 h-5 mr-2" />
+                    Detailed Order: {expandedOrder.restaurant}
+                </h4>
+                <button 
+                    onClick={() => setExpandedOrder(null)} 
+                    className="text-gray-500 hover:text-gray-700 p-1 rounded-full hover:bg-gray-100 transition"
+                >
+                    <X className="w-5 h-5" />
+                </button>
+            </div>
+            <div className="prose max-w-none text-gray-700" dangerouslySetInnerHTML={{ __html: expandedOrder.details.replace(/\n/g, '<br/>') }}></div>
+            <p className="text-xs text-gray-500 italic pt-2 border-t border-blue-200">Generated by Gemini.</p> {/* UPDATED: Yellow -> Blue */}
+        </div>
+      )}
+
+      {userMenus.length === 0 ? (
+        <div className="p-8 text-center bg-cyan-100 rounded-2xl text-cyan-800 border-2 border-dashed border-cyan-400 shadow-inner"> {/* UPDATED: Orange -> Cyan */}
+          <p className="font-semibold text-lg">You haven't added any go-to orders yet!</p>
+          <p className="text-sm mt-1">Use the form above to start building your Master Menu.</p>
+        </div>
+      ) : (
+        userMenus
+          .sort((a, b) => {
+            const profileA = getProfileName(a.profileId);
+            const profileB = getProfileName(b.profileId);
+            if (profileA !== profileB) return profileA.localeCompare(profileB);
+            return a.name.localeCompare(b.name);
+          })
+          .map((menu) => (
+            <div key={menu.id} className="flex flex-col sm:flex-row justify-between items-start sm:items-center p-5 bg-white border border-gray-100 rounded-2xl shadow-lg hover:shadow-xl transition duration-200">
+              <div className="flex-1 min-w-0 mb-3 sm:mb-0">
+                <p className="text-sm font-medium text-cyan-600 flex items-center mb-1"> {/* UPDATED: Orange -> Cyan */}
+                    {getProfile(menu.profileId)?.type === 'Kid' ? <Shield className="w-4 h-4 mr-1 text-emerald-500" /> : <Shield className="w-4 h-4 mr-1 text-blue-500" />}
+                    {getProfileName(menu.profileId)}
+                </p>
+                <p className="text-xl font-bold text-gray-800 truncate">{menu.name}</p>
+                <p className="text-md text-gray-600 italic truncate mt-1">{menu.order}</p>
+              </div>
+              <div className="flex space-x-3 items-center">
+                <button
+                    onClick={() => generateOrderDetails(menu.name, menu.order)}
+                    // UPDATED: Amber -> Teal
+                    className="flex items-center text-sm bg-teal-500 text-white p-3 rounded-xl font-semibold hover:bg-teal-600 transition duration-150 shadow-md disabled:opacity-50 transform hover:scale-[1.05]"
+                    disabled={isLlmLoading}
+                >
+                    <Sparkles className="w-4 h-4 mr-1" /> Details
+                </button>
+                <button
+                  onClick={() => deleteMenuItem(menu.id)}
+                  className="p-3 text-red-500 hover:text-red-700 rounded-full transition duration-150 bg-red-50 hover:bg-red-100 shadow-md"
+                  aria-label={`Delete order for ${menu.name}`}
+                >
+                  <Trash2 className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+          ))
+      )}
+    </div>
+  );
+
+  const GroupList = () => {
+    // ... (GroupList component logic is unchanged in functionality, just uses new functions)
+    const [newGroupName, setNewGroupName] = useState('');
+    const [activeGroup, setActiveGroup] = useState(null);
+    const [newRestaurantName, setNewRestaurantName] = useState('');
+    const [newOrder, setNewOrder] = useState('');
+    const [inviteId, setInviteId] = useState('');
+    
+    useEffect(() => {
+        setCompromiseSuggestion(null);
+        setInviteMessage(null);
+    }, [activeGroup]);
+
+
+    const handleCreateGroup = (e) => {
+      e.preventDefault();
+      createGroup(newGroupName);
+      setNewGroupName('');
+    };
+
+    const handleAddOrder = (e) => {
+      e.preventDefault();
+      addOrderToGroup(activeGroup.id, newRestaurantName, newOrder);
+      setNewRestaurantName('');
+      setNewOrder('');
+    };
+    
+    const handleInviteUser = (e) => {
+        e.preventDefault();
+        inviteUserToGroup(activeGroup.id, inviteId);
+        setInviteId('');
+    };
+
+    const handleCompromise = () => {
+        if (activeGroup) {
+            generateGroupCompromise(activeGroup);
+        }
+    };
+    
+    const handleGenerateInvite = () => {
+        if (activeGroup) {
+            generateGroupInviteMessage(activeGroup);
+        }
+    };
+    
+    const copyMessageText = (text) => {
+        copyText(text, "Invite message copied to clipboard!");
+    };
+
+
+    if (activeGroup) {
+        
+        // Calculate Vote Winner
+        const voteCounts = (activeGroup.restaurantOrders || []).map(rest => ({
+            name: rest.restaurantName,
+            count: (rest.votes || []).length
+        }));
+
+        let winner = null;
+        if (voteCounts.length > 0) {
+            const maxVotes = Math.max(...voteCounts.map(vc => vc.count));
+            const winners = voteCounts.filter(vc => vc.count === maxVotes && maxVotes > 0);
+            if (winners.length === 1) {
+                winner = winners[0].name;
+            }
+        }
+
+
+      return (
+        <div className="p-6 bg-white rounded-2xl shadow-xl">
+          <button
+            onClick={() => setActiveGroup(null)}
+            // UPDATED: Orange -> Cyan
+            className="text-cyan-600 hover:text-cyan-800 font-semibold mb-6 flex items-center transition duration-150"
+          >
+            <CornerDownLeft className="w-4 h-4 mr-2" /> Back to All Groups
+          </button>
+          <h3 className="text-2xl font-bold text-gray-800 mb-3">{activeGroup.name}</h3>
+          <p className="text-sm text-gray-500 mb-6 border-b pb-4">Members: {activeGroup.members ? activeGroup.members.length : 1}</p>
+          
+          {isLlmLoading && <LlmLoader />}
+          
+          {inviteMessage && (
+            // UPDATED: Slate -> Gray
+            <div className="p-4 mb-6 bg-gray-100 rounded-xl shadow-md border-l-4 border-gray-500 space-y-3">
+                <div className="flex justify-between items-center">
+                    <h4 className="text-lg font-bold text-gray-800 flex items-center">
+                        <Zap className="w-5 h-5 mr-2" /> Dinner Invite Message
+                    </h4>
+                    <button 
+                        onClick={() => setInviteMessage(null)} 
+                        className="text-gray-500 hover:text-gray-700 p-1 rounded-full hover:bg-gray-200 transition"
+                    >
+                        <X className="w-5 h-5" />
+                    </button>
+                </div>
+                <p className="whitespace-pre-wrap text-gray-800 font-medium my-2">{inviteMessage.message}</p> 
+                <button 
+                    onClick={() => copyMessageText(inviteMessage.message)}
+                    // UPDATED: Slate -> Gray/Cyan
+                    className="flex items-center text-sm bg-cyan-600 text-white p-2 rounded-lg font-semibold hover:bg-cyan-700 transition duration-150 shadow-md"
+                >
+                    <Copy className="w-4 h-4 mr-1" /> Copy Message
+                </button>
+            </div>
+          )}
+
+          {compromiseSuggestion && (
+            // UPDATED: Yellow -> Blue
+            <div className="p-4 mb-6 bg-blue-50 rounded-xl shadow-md border-l-4 border-blue-500 space-y-3">
+                <div className="flex justify-between items-center">
+                    <h4 className="text-lg font-bold text-blue-800 flex items-center">
+                        <Sparkles className="w-5 h-5 mr-2" /> Compromise Suggestion
+                    </h4>
+                    <button 
+                        onClick={() => setCompromiseSuggestion(null)} 
+                        className="text-gray-500 hover:text-gray-700 p-1 rounded-full hover:bg-gray-100 transition"
+                    >
+                        <X className="w-5 h-5" />
+                    </button>
+                </div>
+                <div className="prose max-w-none text-gray-700" dangerouslySetInnerHTML={{ __html: compromiseSuggestion.suggestion.replace(/\n/g, '<br/>') }}></div>
+            </div>
+          )}
+          
+          {activeGroup.restaurantOrders && activeGroup.restaurantOrders.length > 0 && (
+            // UPDATED: Orange -> Cyan
+            <div className="flex flex-col space-y-3 mb-6 p-4 border border-cyan-300 rounded-xl bg-cyan-50 shadow-inner">
+                <button
+                    onClick={handleGenerateInvite} 
+                    // UPDATED: Orange -> Cyan
+                    className="w-full flex items-center justify-center bg-cyan-700 text-white p-3 rounded-xl font-semibold hover:bg-cyan-800 transition duration-150 shadow-lg disabled:opacity-50 transform hover:scale-[1.01]"
+                    disabled={isLlmLoading}
+                >
+                    <Zap className="w-5 h-5 mr-2" /> 
+                    Generate Dinner Invite Message
+                </button>
+                <button
+                    onClick={handleCompromise}
+                    // UPDATED: Amber -> Teal
+                    className="w-full flex items-center justify-center bg-teal-500 text-white p-3 rounded-xl font-semibold hover:bg-teal-600 transition duration-150 shadow-lg disabled:opacity-50 transform hover:scale-[1.01]"
+                    disabled={isLlmLoading}
+                >
+                    <Sparkles className="w-5 h-5 mr-2" /> 
+                    Suggest Group Compromise
+                </button>
+            </div>
+          )}
+
+          {/* Invite User Form */}
+          <form onSubmit={handleInviteUser} className="p-4 mb-6 border-2 border-dashed border-gray-300 rounded-xl bg-gray-100 shadow-inner"> {/* UPDATED: Stone -> Gray */}
+            <p className="font-semibold text-gray-700 mb-3 flex items-center">
+                <UserPlus className="w-4 h-4 mr-2" /> Invite a Friend (by User ID)
+            </p>
+            <div className="flex space-x-2">
+              <input
+                type="text"
+                placeholder="Paste Friend's User ID here"
+                value={inviteId}
+                onChange={(e) => setInviteId(e.target.value)}
+                required
+                className="flex-1 p-3 border border-gray-300 rounded-xl focus:ring-cyan-500"
+              />
+              <button
+                type="submit"
+                // UPDATED: Orange -> Cyan
+                className="bg-cyan-700 text-white p-3 rounded-xl font-semibold hover:bg-cyan-800 transition shadow-md"
+              >
+                Invite
+              </button>
+            </div>
+          </form>
+
+          {/* Add/Update Order Form */}
+          <form onSubmit={handleAddOrder} className="p-4 mb-6 border-2 border-dashed border-cyan-300 rounded-xl bg-cyan-50 shadow-inner"> {/* UPDATED: Orange -> Cyan */}
+            <p className="font-semibold text-cyan-700 mb-3">Add/Update Your Group Order</p> {/* UPDATED: Orange -> Cyan */}
+            <div className="flex flex-col sm:flex-row space-y-2 sm:space-y-0 sm:space-x-2 mb-2">
+              <input
+                type="text"
+                placeholder="Restaurant"
+                value={newRestaurantName}
+                onChange={(e) => setNewRestaurantName(e.target.value)}
+                required
+                className="flex-1 p-3 border border-cyan-300 rounded-xl focus:ring-cyan-500"
+              />
+              <input
+                type="text"
+                placeholder="Your Order"
+                value={newOrder}
+                onChange={(e) => setNewOrder(e.target.value)}
+                required
+                className="flex-1 p-3 border border-cyan-300 rounded-xl focus:ring-cyan-500"
+              />
+            </div>
+            <button
+              type="submit"
+              // UPDATED: Orange -> Cyan
+              className="w-full bg-cyan-600 text-white p-3 rounded-xl font-semibold hover:bg-cyan-700 transition shadow-md mt-2"
+            >
+              Save Your Order
+            </button>
+          </form>
+
+          {/* Group Orders List with Voting */}
+          <h4 className="text-xl font-bold text-gray-700 mt-6 mb-4 border-b pb-2">Go-To Group Orders & Vote</h4>
+          <div className="space-y-4">
+            {activeGroup.restaurantOrders && activeGroup.restaurantOrders.length > 0 ? (
+              activeGroup.restaurantOrders.map((rest, index) => {
+                const voteCount = (rest.votes || []).length;
+                const userVoted = (rest.votes || []).includes(userId);
+                const isWinner = rest.restaurantName === winner;
+
+                return (
+                  <div key={index} className={`p-4 border rounded-xl shadow-lg transition duration-200 ${isWinner ? 'border-emerald-500 bg-emerald-50' : 'border-gray-200 bg-white'}`}>
+                    <div className="flex justify-between items-center mb-3">
+                        <p className={`font-bold text-lg ${isWinner ? 'text-emerald-700' : 'text-cyan-800'} flex items-center`}> {/* UPDATED: Orange -> Cyan */}
+                            {rest.restaurantName}
+                            {isWinner && <Crown className="w-5 h-5 ml-2 text-yellow-500 fill-yellow-500" />}
+                        </p>
+                        <button
+                            onClick={() => handleVote(activeGroup.id, rest.restaurantName)}
+                            className={`flex items-center text-sm p-2 rounded-xl font-semibold transition shadow-md min-w-[70px] justify-center ${
+                                userVoted 
+                                    ? 'bg-cyan-600 text-white hover:bg-cyan-700'  /* UPDATED: Orange -> Cyan */
+                                    : 'bg-cyan-100 text-cyan-600 hover:bg-cyan-200' /* UPDATED: Orange -> Cyan */
+                            }`}
+                        >
+                            <span className="mr-1">{voteCount}</span> Vote
+                        </button>
+                    </div>
+                    <ul className="space-y-1 mt-2 border-t pt-2 border-gray-100">
+                      {rest.orders.map((order, orderIndex) => {
+                        const member = activeGroup.members.find(m => m.uid === order.userId);
+                        const displayName = member ? member.name : getDisplayName(order.userId);
+                        const isCurrentUser = order.userId === userId;
+                        return (
+                          <li key={orderIndex} className={`text-sm p-1 rounded ${isCurrentUser ? 'font-semibold text-gray-900 bg-blue-100 border border-blue-300' : 'text-gray-600 bg-white'}`}> {/* UPDATED: Yellow -> Blue */}
+                            <span className="font-medium text-gray-800 mr-2">{displayName}:</span>
+                            {order.order}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                );
+              })
+            ) : (
+              <p className="text-center text-gray-500 p-4 bg-gray-100 rounded-xl shadow-inner">No orders saved for this group yet. Be the first!</p>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-6">
+        {/* Create Group Form */}
+        <form onSubmit={handleCreateGroup} className="p-6 bg-cyan-50 rounded-2xl shadow-xl border border-cyan-200"> {/* UPDATED: Orange -> Cyan */}
+          <p className="font-semibold text-cyan-700 mb-2 text-lg">Create a New Group</p> {/* UPDATED: Orange -> Cyan */}
+          <div className="flex space-x-2">
+            <input
+              type="text"
+              placeholder="Enter Group Name"
+              value={newGroupName}
+              onChange={(e) => setNewGroupName(e.target.value)}
+              required
+              className="flex-1 p-3 border border-cyan-300 rounded-xl focus:ring-cyan-500 shadow-sm"
+            />
+            <button
+              type="submit"
+              className="bg-cyan-700 text-white p-3 rounded-xl font-semibold hover:bg-cyan-800 transition shadow-md"
+            >
+              <Users className="w-5 h-5" />
+            </button>
+          </div>
+        </form>
+
+        {/* List of Groups */}
+        <h3 className="text-2xl font-bold text-gray-800 border-b pb-2">Your Groups ({groups.length})</h3>
+        <div className="space-y-4">
+          {groups.length === 0 ? (
+            <div className="p-8 text-center bg-gray-100 rounded-2xl text-gray-700 border-2 border-dashed border-gray-300 shadow-inner"> {/* UPDATED: Stone -> Gray */}
+              You are not a member of any groups. Create one above!
+            </div>
+          ) : (
+            groups
+              .sort((a, b) => a.name.localeCompare(b.name))
+              .map((group) => (
+                <div
+                  key={group.id}
+                  // UPDATED: Orange -> Cyan
+                  className="p-5 bg-white border border-gray-100 rounded-2xl shadow-lg flex justify-between items-center cursor-pointer hover:bg-cyan-50 transition duration-200 transform hover:scale-[1.01]"
+                  onClick={() => setActiveGroup(group)}
+                >
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xl font-semibold text-gray-800 truncate">{group.name}</p>
+                    <p className="text-sm text-gray-500 mt-1">Members: {group.members ? group.members.length : 1}</p>
+                  </div>
+                  <button
+                    className="p-2 text-cyan-600 hover:text-cyan-800 rounded-full transition duration-150"
+                  >
+                    <CornerDownLeft className="w-5 h-5 rotate-180" />
+                  </button>
+                </div>
+              ))
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const SuggestDinner = () => (
+    // UPDATED: Orange -> Cyan
+    <div className="flex flex-col items-center justify-center p-8 bg-cyan-100 rounded-2xl shadow-2xl border-4 border-cyan-400">
+      <h3 className="text-3xl font-extrabold text-cyan-800 mb-6 flex items-center">
+        <Lightbulb className="w-8 h-8 mr-3 text-cyan-600 fill-cyan-300" /> {/* UPDATED: Orange -> Cyan */}
+      </h3>
+
+      <button
+        onClick={suggestDinner}
+        // UPDATED: Orange -> Cyan
+        className="flex items-center justify-center bg-cyan-800 text-white text-xl p-4 rounded-xl font-bold shadow-2xl hover:bg-cyan-900 transition duration-200 transform hover:scale-[1.05]"
+        disabled={userMenus.filter(m => m.profileId === 'self').length === 0 || isLlmLoading}
+      >
+        <Swords className="w-6 h-6 mr-3" />
+        {isLlmLoading ? "Consulting the Culinary Oracle..." : (userMenus.filter(m => m.profileId === 'self').length === 0 ? "Add YOUR Menus to Decide" : "Suggest Dinner Now!")}
+      </button>
+
+      <div className="mt-8 w-full">
+        {isLlmLoading && <LlmLoader message="The Master Menu is deciding for you..." />}
+
+        {currentSuggestion && !isLlmLoading && (
+          <div className="w-full text-center space-y-6">
+            
+            <div className="p-8 bg-white rounded-xl shadow-xl border-t-4 border-cyan-500 animate-fadeIn"> {/* UPDATED: Orange -> Cyan */}
+              <p className="text-md text-gray-500 mb-2 font-medium">The prophecy has been cast:</p>
+              <p className="text-5xl font-extrabold text-cyan-700 animate-bounceOnce">{currentSuggestion.restaurant}</p> {/* UPDATED: Orange -> Cyan */}
+              <p className="text-2xl text-gray-700 italic mt-3">({currentSuggestion.order})</p>
+            </div>
+
+            {suggestionJustification ? (
+              <div className="p-6 bg-blue-50 rounded-xl shadow-lg border-l-4 border-blue-500 text-left"> {/* UPDATED: Yellow -> Blue */}
+                <h4 className="text-xl font-bold text-blue-800 flex items-center mb-2"> {/* UPDATED: Yellow -> Blue */}
+                    <Sparkles className="w-5 h-5 mr-2" />
+                    Why This Pick is Perfect
+                </h4>
+                <div className="prose max-w-none text-gray-700" dangerouslySetInnerHTML={{ __html: suggestionJustification.replace(/\n/g, '<br/>') }}></div>
+                <p className="text-xs text-gray-500 italic pt-3 border-t border-blue-200 mt-3">Decision fueled by Gemini AI.</p> {/* UPDATED: Yellow -> Blue */}
+              </div>
+            ) : (
+                <p className="text-gray-500 italic">No justification found.</p>
+            )}
+          </div>
+        )}
+
+        {!currentSuggestion && !isLlmLoading && (
+             <p className="mt-5 text-lg text-cyan-700 font-medium">Click the button to let fate decide your next delicious meal.</p>
+        )}
+      </div>
+      
+      {userMenus.length > 0 && (
+        <p className="mt-5 text-sm text-cyan-700 font-medium">Drawing from {userMenus.length} saved go-to orders.</p>
+      )}
+    </div>
+  );
+
+
+  // --- Main Render ---
+
+  if (!isAuthReady) {
+    return <LoadingState />;
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 font-sans"> {/* UPDATED: Stone -> Gray */}
+      <MessageBar />
+
+      <header className="bg-gray-800 text-white p-6 shadow-2xl"> {/* UPDATED: Stone -> Gray */}
+        <h1 className="text-4xl font-extrabold flex items-center">
+          <Utensils className="w-9 h-9 mr-3 text-cyan-300" /> {/* UPDATED: Amber -> Cyan */}
+          The Master Menu
+        </h1>
+        <p className="text-sm opacity-80 mt-1 font-light">
+            Go To Order At All Your Food Spots
+        </p>
+        {userSettings.role && (
+            <span className='mt-2 inline-block px-3 py-1 bg-teal-500 text-white text-xs font-bold rounded-full shadow-md'> {/* UPDATED: Amber -> Teal */}
+                {userSettings.role}
+            </span>
+        )}
+        <div className="text-xs mt-3 flex items-center">
+          <span className="mr-2 opacity-80 font-mono">Authenticated User ID: {userId}</span>
+          <button onClick={copyUserId} className="text-cyan-200 hover:text-white p-1 rounded transition duration-150 transform hover:scale-110" title="Click to copy your User ID"> {/* UPDATED: Amber -> Cyan */}
+            <Copy className="w-4 h-4" />
+          </button>
+        </div>
+      </header>
+
+      {/* Navigation Tabs */}
+      <nav className="bg-white shadow-lg sticky top-0 z-10">
+        <div className="flex justify-around border-b border-gray-200 max-w-4xl mx-auto">
+          <TabButton icon={Utensils} label="My Master Menu" tabId="menu" activeTab={activeTab} setActiveTab={setActiveTab} />
+          <TabButton icon={Users} label="Groups" tabId="groups" activeTab={activeTab} setActiveTab={setActiveTab} />
+          <TabButton icon={Lightbulb} label="Pick For Me" tabId="suggest" activeTab={activeTab} setActiveTab={setActiveTab} />
+        </div>
+      </nav>
+
+      <main className="p-4 max-w-4xl mx-auto">
+        {activeTab === 'menu' && (
+          <div className="space-y-6">
+            <h2 className="text-3xl font-bold text-gray-800 border-b pb-2 mt-4">My Master Menu</h2>
+            <RoleSelector />
+            <AddFamilyProfileForm />
+            <AllergySummary />
+            <AddMenuItemForm />
+            <MenuList />
+          </div>
+        )}
+
+        {activeTab === 'groups' && (
+          <div>
+            <h2 className="text-3xl font-bold text-gray-800 border-b pb-2 mt-4">Group Orders Tracker</h2>
+            <GroupList />
+          </div>
+        )}
+
+        {activeTab === 'suggest' && (
+          <div>
+            <h2 className="text-3xl font-bold text-gray-800 border-b pb-2 mt-4">Pick For Me</h2>
+            <SuggestDinner />
+          </div>
+        )}
+      </main>
+    </div>
+  );
+};
+
+// Simple reusable component for the tab navigation
+const TabButton = ({ icon: Icon, label, tabId, activeTab, setActiveTab }) => {
+  const isActive = activeTab === tabId;
+  return (
+    <button
+      onClick={() => setActiveTab(tabId)}
+      className={`flex-1 flex flex-col items-center p-4 text-md font-semibold transition duration-200 ${
+        isActive
+          // UPDATED: Orange -> Cyan
+          ? 'text-cyan-700 border-b-4 border-cyan-700 bg-cyan-50 shadow-inner'
+          : 'text-gray-500 hover:text-cyan-600 hover:bg-gray-50' // UPDATED: Orange -> Cyan
+      }`}
+    >
+      <Icon className="w-5 h-5 mb-1" />
+      {label}
+    </button>
+  );
+};
+
+export default App;
